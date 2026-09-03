@@ -1,6 +1,7 @@
 package cycletls
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	stdhttp "net/http"
@@ -11,6 +12,47 @@ import (
 
 	http "github.com/Danny-Dasilva/fhttp"
 )
+
+func TestTLSHandshakeRespectsContext(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	rt := newRoundTripper(Browser{
+		UserAgent:          "Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36",
+		InsecureSkipVerify: true,
+		ForceHTTP1:         true,
+	}).(*roundTripper)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	result := make(chan error, 1)
+	go func() {
+		_, dialErr := rt.dialTLS(ctx, "tcp", listener.Addr().String())
+		result <- dialErr
+	}()
+	serverConn := <-accepted
+	defer serverConn.Close()
+
+	select {
+	case dialErr := <-result:
+		if dialErr == nil {
+			t.Fatal("expected the canceled TLS handshake to fail")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("TLS handshake did not stop after context cancellation")
+	}
+}
 
 // Test that getTransport no longer panics when dialTLS returns (conn, nil)
 // due to a cached connection/transport already being present for the address.

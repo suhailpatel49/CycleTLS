@@ -295,7 +295,7 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 	}
 
 	// Perform TLS handshake
-	if err = conn.Handshake(); err != nil {
+	if err = conn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 
 		if err.Error() == "tls: CurvePreferences includes unsupported curve" {
@@ -420,7 +420,7 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 	}
 
 	// Perform TLS handshake for retry
-	if err = conn.Handshake(); err != nil {
+	if err = conn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("TLS 1.3 compatible handshake failed: %+v", err)
 	}
@@ -499,7 +499,7 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 	}
 
 	// Perform TLS handshake for fallback
-	if err = conn.Handshake(); err != nil {
+	if err = conn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("original TLS 1.2 handshake failed: %+v", err)
 	}
@@ -552,7 +552,9 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 }
 
 func (rt *roundTripper) dialTLSHTTP2(network, addr string, _ *utls.Config) (net.Conn, error) {
-	return rt.dialTLS(context.Background(), network, addr)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return rt.dialTLS(ctx, network, addr)
 }
 
 func (rt *roundTripper) getDialTLSAddr(req *http.Request) string {
@@ -676,7 +678,7 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request) (*http.Response, err
 	rt.Unlock()
 
 	// Convert fhttp.Request to net/http.Request
-	stdReq := &stdhttp.Request{
+	stdReq := (&stdhttp.Request{
 		Method:           req.Method,
 		URL:              req.URL,
 		Proto:            req.Proto,
@@ -698,7 +700,7 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request) (*http.Response, err
 		TLS:              nil,
 		Cancel:           req.Cancel,
 		Response:         nil,
-	}
+	}).WithContext(req.Context())
 
 	// Use the RoundTripper to make the request
 	stdResp, err := roundTripper.RoundTrip(stdReq)

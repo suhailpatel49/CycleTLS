@@ -98,12 +98,14 @@ type cycleTLSRequest struct {
 
 // rename to request+client+options
 type fullRequest struct {
-	req       *http.Request
-	client    http.Client
-	options   cycleTLSRequest
-	err       error
-	sseClient *SSEClient       // For SSE connections
-	wsClient  *WebSocketClient // For WebSocket connections
+	req           *http.Request
+	client        http.Client
+	options       cycleTLSRequest
+	err           error
+	state         *requestState
+	ownerRequests *sync.Map
+	sseClient     *SSEClient       // For SSE connections
+	wsClient      *WebSocketClient // For WebSocket connections
 }
 
 // CycleTLS creates full request and response
@@ -126,15 +128,62 @@ func WithRawBytes() Option {
 	}
 }
 
-var activeRequests = make(map[string]context.CancelFunc)
+type requestState struct {
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	resume chan struct{}
+}
+
+func (state *requestState) setPaused(paused bool) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if paused && state.resume == nil {
+		state.resume = make(chan struct{})
+	} else if !paused && state.resume != nil {
+		close(state.resume)
+		state.resume = nil
+	}
+}
+
+func (state *requestState) wait(ctx context.Context) bool {
+	for {
+		state.mu.Lock()
+		resume := state.resume
+		state.mu.Unlock()
+		if resume == nil {
+			return true
+		}
+		select {
+		case <-resume:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+func trackRequest(requestID string, cancel context.CancelFunc) *requestState {
+	state := &requestState{cancel: cancel}
+	activeRequestsMutex.Lock()
+	activeRequests[requestID] = state
+	activeRequestsMutex.Unlock()
+	return state
+}
+
+func newRequestContext(timeout int) (context.Context, context.CancelFunc) {
+	if timeout == 0 {
+		timeout = 15
+	}
+	return context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+}
+
+var activeRequests = make(map[string]*requestState)
 var activeRequestsMutex sync.Mutex
 var requestSlots = make(chan struct{}, 512)
+var pendingRequestSlots = make(chan struct{}, 4096)
 var debugLogger = log.New(os.Stdout, "DEBUG: ", log.Ldate|log.Ltime|log.Lshortfile)
 
 // ready Request
 func processRequest(request cycleTLSRequest) (result fullRequest) {
-	ctx, cancel := context.WithCancel(context.Background())
-
 	var browser = Browser{
 		// TLS fingerprinting options
 		JA3:              request.Options.Ja3,
@@ -172,6 +221,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 		// HTTP/3 requests are now supported
 		return dispatchHTTP3Request(request)
 	}
+	ctx, cancel := newRequestContext(request.Options.Timeout)
 
 	// Default to true for connection reuse
 	enableConnectionReuse := true
@@ -291,16 +341,12 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 	}
 	req.Header.Set("user-agent", request.Options.UserAgent)
 
-	activeRequestsMutex.Lock()
-	activeRequests[request.RequestID] = cancel
-	activeRequestsMutex.Unlock()
-
-	return fullRequest{req: req, client: client, options: request}
+	return fullRequest{req: req, client: client, options: request, state: trackRequest(request.RequestID, cancel)}
 }
 
 // dispatchHTTP3Request handles HTTP/3 specific request processing
 func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := newRequestContext(request.Options.Timeout)
 
 	// Create browser configuration for HTTP/3
 	var browser = Browser{
@@ -382,16 +428,12 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 	}
 	req.Header.Set("user-agent", request.Options.UserAgent)
 
-	activeRequestsMutex.Lock()
-	activeRequests[request.RequestID] = cancel
-	activeRequestsMutex.Unlock()
-
-	return fullRequest{req: req, client: client, options: request}
+	return fullRequest{req: req, client: client, options: request, state: trackRequest(request.RequestID, cancel)}
 }
 
 // dispatchSSERequest handles SSE specific request processing
 func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := newRequestContext(request.Options.Timeout)
 
 	// Create browser configuration for SSE
 	var browser = Browser{
@@ -455,14 +497,11 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 		return fullRequest{options: request, err: err}
 	}
 
-	activeRequestsMutex.Lock()
-	activeRequests[request.RequestID] = cancel
-	activeRequestsMutex.Unlock()
-
 	return fullRequest{
 		req:       req,
 		client:    client,
 		options:   request,
+		state:     trackRequest(request.RequestID, cancel),
 		sseClient: sseClient,
 	}
 }
@@ -519,14 +558,11 @@ func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
 		return fullRequest{options: request, err: err}
 	}
 
-	activeRequestsMutex.Lock()
-	activeRequests[request.RequestID] = cancel
-	activeRequestsMutex.Unlock()
-
 	return fullRequest{
 		req:      req,
 		client:   http.Client{}, // Empty client as WebSocket uses its own dialer
 		options:  request,
+		state:    trackRequest(request.RequestID, cancel),
 		wsClient: wsClient,
 	}
 }
@@ -627,7 +663,36 @@ func writeErrorFrame(requestID string, statusCode int, message string, chanWrite
 	chanWrite <- b.Bytes()
 }
 
+func (res fullRequest) writeDataFrame(chanWrite chan []byte, frame []byte) bool {
+	if res.state != nil && !res.state.wait(res.req.Context()) {
+		writeErrorFrame(res.options.RequestID, nhttp.StatusRequestTimeout, res.req.Context().Err().Error(), chanWrite)
+		return false
+	}
+	select {
+	case chanWrite <- frame:
+		return true
+	case <-res.req.Context().Done():
+		writeErrorFrame(res.options.RequestID, nhttp.StatusRequestTimeout, res.req.Context().Err().Error(), chanWrite)
+		return false
+	}
+}
+
+func finishRequest(res fullRequest) {
+	if res.state != nil {
+		res.state.cancel()
+		activeRequestsMutex.Lock()
+		if activeRequests[res.options.RequestID] == res.state {
+			delete(activeRequests, res.options.RequestID)
+		}
+		activeRequestsMutex.Unlock()
+	}
+	if res.ownerRequests != nil {
+		res.ownerRequests.Delete(res.options.RequestID)
+	}
+}
+
 func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
+	defer finishRequest(res)
 	if res.err != nil {
 		parsedError := parseError(res.err)
 		writeErrorFrame(res.options.RequestID, parsedError.StatusCode, parsedError.ErrorMsg+"-> \n"+res.err.Error(), chanWrite)
@@ -645,12 +710,6 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 		dispatchWebSocketAsync(res, chanWrite)
 		return
 	}
-
-	defer func() {
-		activeRequestsMutex.Lock()
-		delete(activeRequests, res.options.RequestID)
-		activeRequestsMutex.Unlock()
-	}()
 
 	finalUrl := res.options.Options.URL
 
@@ -723,14 +782,16 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 			select {
 			case <-res.req.Context().Done():
 				debugLogger.Printf("Request %s was canceled during processing", res.options.RequestID)
-				break loop
+				writeErrorFrame(res.options.RequestID, nhttp.StatusRequestTimeout, res.req.Context().Err().Error(), chanWrite)
+				return
 
 			default:
 				n, err := resp.Body.Read(chunkBuffer)
 
 				if res.req.Context().Err() != nil {
 					debugLogger.Printf("Request %s was canceled during body read", res.options.RequestID)
-					break loop
+					writeErrorFrame(res.options.RequestID, nhttp.StatusRequestTimeout, res.req.Context().Err().Error(), chanWrite)
+					return
 				}
 
 				if err != nil && err != io.EOF {
@@ -781,7 +842,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 						b.WriteByte(byte(bodyChunkLength))
 						b.Write(chunkBuffer[:n])
 
-						chanWrite <- b.Bytes()
+						if !res.writeDataFrame(chanWrite, b.Bytes()) {
+							return
+						}
 					}
 					// EOF reached, exit the loop
 					break loop
@@ -808,7 +871,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 				b.WriteByte(byte(bodyChunkLength))
 				b.Write(chunkBuffer[:n])
 
-				chanWrite <- b.Bytes()
+				if !res.writeDataFrame(chanWrite, b.Bytes()) {
+					return
+				}
 			}
 		}
 	}
@@ -830,12 +895,6 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 
 // dispatchSSEAsync handles SSE connections asynchronously
 func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
-	defer func() {
-		activeRequestsMutex.Lock()
-		delete(activeRequests, res.options.RequestID)
-		activeRequestsMutex.Unlock()
-	}()
-
 	// Connect to SSE endpoint
 	sseResp, err := res.sseClient.Connect(res.req.Context(), res.options.Options.URL)
 	if err != nil {
@@ -917,7 +976,8 @@ loop:
 		select {
 		case <-res.req.Context().Done():
 			debugLogger.Printf("SSE request %s was canceled", res.options.RequestID)
-			break loop
+			writeErrorFrame(res.options.RequestID, nhttp.StatusRequestTimeout, res.req.Context().Err().Error(), chanWrite)
+			return
 
 		default:
 			event, err := sseResp.NextEvent()
@@ -965,7 +1025,9 @@ loop:
 			b.WriteByte(byte(bodyChunkLength))
 			b.Write(eventBytes)
 
-			chanWrite <- b.Bytes()
+			if !res.writeDataFrame(chanWrite, b.Bytes()) {
+				return
+			}
 		}
 	}
 
@@ -987,12 +1049,6 @@ loop:
 
 // dispatchWebSocketAsync handles WebSocket connections asynchronously
 func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
-	defer func() {
-		activeRequestsMutex.Lock()
-		delete(activeRequests, res.options.RequestID)
-		activeRequestsMutex.Unlock()
-	}()
-
 	// Connect to WebSocket endpoint
 	conn, resp, err := res.wsClient.Connect(res.options.Options.URL)
 	if err != nil {
@@ -1119,10 +1175,12 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 	}
 
 	// Read WebSocket messages
+loop:
 	for {
 		select {
 		case <-res.req.Context().Done():
 			debugLogger.Printf("WebSocket request %s was canceled", res.options.RequestID)
+			writeErrorFrame(res.options.RequestID, nhttp.StatusRequestTimeout, res.req.Context().Err().Error(), chanWrite)
 			return
 
 		default:
@@ -1130,7 +1188,7 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 			if err != nil {
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 					// Normal close
-					break
+					break loop
 				}
 				debugLogger.Printf("WebSocket read error: %s", err.Error())
 				return
@@ -1166,7 +1224,9 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 			b.WriteByte(byte(bodyChunkLength))
 			b.Write(msgBytes)
 
-			chanWrite <- b.Bytes()
+			if !res.writeDataFrame(chanWrite, b.Bytes()) {
+				return
+			}
 		}
 	}
 
@@ -1203,16 +1263,18 @@ func writeSocket(chanWrite chan []byte, wsSocket *websocket.Conn) {
 }
 
 func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
-	requestIDs := make(map[string]struct{})
+	var requestIDs sync.Map
 	defer func() {
-		activeRequestsMutex.Lock()
-		for requestID := range requestIDs {
-			if cancel, exists := activeRequests[requestID]; exists {
-				cancel()
+		requestIDs.Range(func(key, _ interface{}) bool {
+			requestID := key.(string)
+			activeRequestsMutex.Lock()
+			if state, exists := activeRequests[requestID]; exists {
+				state.cancel()
 				delete(activeRequests, requestID)
 			}
-		}
-		activeRequestsMutex.Unlock()
+			activeRequestsMutex.Unlock()
+			return true
+		})
 		close(chanRead)
 	}()
 
@@ -1237,14 +1299,24 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 				wsSocket.Close()
 				return
 			}
-			if action == "cancel" {
+			if action == "cancel" || action == "pause" || action == "resume" {
 				requestId, _ := baseMessage["requestId"].(string)
 				activeRequestsMutex.Lock()
-				if cancel, exists := activeRequests[requestId]; exists {
-					cancel()
+				state, exists := activeRequests[requestId]
+				if action == "cancel" && exists {
 					delete(activeRequests, requestId)
+					requestIDs.Delete(requestId)
 				}
 				activeRequestsMutex.Unlock()
+				if exists {
+					if action == "cancel" {
+						state.cancel()
+					} else if action == "pause" {
+						state.setPaused(true)
+					} else if action == "resume" {
+						state.setPaused(false)
+					}
+				}
 				continue
 			}
 		}
@@ -1254,8 +1326,10 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 			log.Print("Unmarshal Error", err)
 			return
 		}
-		requestIDs[request.RequestID] = struct{}{}
-		chanRead <- processRequest(*request)
+		result := processRequest(*request)
+		result.ownerRequests = &requestIDs
+		requestIDs.Store(request.RequestID, struct{}{})
+		chanRead <- result
 	}
 }
 
@@ -1263,13 +1337,31 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 func readProcess(chanRead chan fullRequest, chanWrite chan []byte) {
 	var requests sync.WaitGroup
 	for request := range chanRead {
-		requestSlots <- struct{}{}
+		if request.req == nil {
+			dispatcherAsync(request, chanWrite)
+			continue
+		}
+		select {
+		case pendingRequestSlots <- struct{}{}:
+		default:
+			writeErrorFrame(request.options.RequestID, nhttp.StatusServiceUnavailable, "CycleTLS request queue is full", chanWrite)
+			finishRequest(request)
+			continue
+		}
 		requests.Add(1)
-		go func() {
+		go func(request fullRequest) {
 			defer requests.Done()
+			defer func() { <-pendingRequestSlots }()
+			select {
+			case requestSlots <- struct{}{}:
+			case <-request.req.Context().Done():
+				writeErrorFrame(request.options.RequestID, nhttp.StatusRequestTimeout, request.req.Context().Err().Error(), chanWrite)
+				finishRequest(request)
+				return
+			}
 			defer func() { <-requestSlots }()
 			dispatcherAsync(request, chanWrite)
-		}()
+		}(request)
 	}
 	requests.Wait()
 	close(chanWrite)

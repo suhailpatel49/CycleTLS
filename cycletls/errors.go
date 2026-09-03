@@ -54,6 +54,15 @@ func parseError(err error) (errormessage errorMessage) {
 	httpError := string(err.Error())
 	//todo - clean this up
 
+	// Check timeouts before generic TLS handshake errors.
+	if strings.Contains(httpError, "context deadline exceeded") ||
+		strings.Contains(httpError, "Client.Timeout") ||
+		strings.Contains(httpError, "context cancellation while reading body") ||
+		strings.Contains(httpError, "i/o timeout") ||
+		strings.Contains(httpError, "timeout") {
+		return createErrorMessage(408, err, "timeout")
+	}
+
 	// Check for TLS certificate errors (should return 495)
 	if strings.Contains(httpError, "uTlsConn.Handshake() error") ||
 		strings.Contains(httpError, "tls: failed to verify certificate") ||
@@ -69,15 +78,6 @@ func parseError(err error) (errormessage errorMessage) {
 		strings.Contains(httpError, "connect: connection refused") ||
 		strings.Contains(httpError, "dial tcp") && strings.Contains(httpError, "connect: connection refused") {
 		return createErrorMessage(502, err, "connection")
-	}
-
-	// Check for common timeout error messages
-	if strings.Contains(httpError, "context deadline exceeded") ||
-		strings.Contains(httpError, "Client.Timeout") ||
-		strings.Contains(httpError, "context cancellation while reading body") ||
-		strings.Contains(httpError, "i/o timeout") ||
-		strings.Contains(httpError, "timeout") {
-		return createErrorMessage(408, err, "timeout")
 	}
 
 	status := lastString(strings.Split(httpError, "StatusCode:"))

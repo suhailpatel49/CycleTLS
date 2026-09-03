@@ -528,18 +528,21 @@ class SharedInstance extends EventEmitter {
   }
 
   async cancelRequest(requestId: string): Promise<void> {
-    if (this.server) {
-      this.server.send(JSON.stringify({ action: "cancel", requestId }));
+    this.sendControl("cancel", requestId);
+  }
+
+  pauseRequest(requestId: string): void {
+    this.sendControl("pause", requestId);
+  }
+
+  resumeRequest(requestId: string): void {
+    this.sendControl("resume", requestId);
+  }
+
+  private sendControl(action: string, requestId: string): void {
+    if (this.server?.readyState === WebSocket.OPEN) {
+      this.server.send(JSON.stringify({ action, requestId }));
     }
-  }
-
-  pauseResponses(): void {
-    // ponytail: this pauses the shared socket. Split by client if one slow stream blocks others.
-    (this.server as any)?._socket?.pause();
-  }
-
-  resumeResponses(): void {
-    (this.server as any)?._socket?.resume();
   }
 
   private async cleanExit(message?: string | Error): Promise<void> {
@@ -754,14 +757,18 @@ class CycleTLSClientImpl extends EventEmitter {
           // Remove the message handler and set up stream handling
           this.off(requestId, handleMessage);
 
-          const stream = new Readable({
-            read: () => this.sharedInstance.resumeResponses()
-          });
+          let paused = false;
+          const resume = () => {
+            if (!paused) return;
+            paused = false;
+            this.sharedInstance.resumeRequest(requestId);
+          };
+          const stream = new Readable({ read: resume });
           responseStream = stream;
 
           const handleClose = () => {
             cleanupAbort();
-            this.sharedInstance.resumeResponses();
+            resume();
             this.sharedInstance.cancelRequest(requestId);
           };
 
@@ -769,8 +776,9 @@ class CycleTLSClientImpl extends EventEmitter {
 
           const handleData = (response: any) => {
             if (response.method === "data") {
-              if (!stream.push(Buffer.from(response.data))) {
-                this.sharedInstance.pauseResponses();
+              if (!stream.push(Buffer.from(response.data)) && !paused) {
+                paused = true;
+                this.sharedInstance.pauseRequest(requestId);
               }
             } else if (response.method === "error") {
               // Handle error that occurred during body read - store it and close the stream
@@ -786,13 +794,13 @@ class CycleTLSClientImpl extends EventEmitter {
                 stream.push(null);
                 stream.off("close", handleClose);
               }
-              this.sharedInstance.resumeResponses();
+              resume();
               cleanupAbort();
               this.off(requestId, handleData);
             } else if (response.method === "end") {
               stream.push(null);
               stream.off("close", handleClose);
-              this.sharedInstance.resumeResponses();
+              resume();
               cleanupAbort();
               this.off(requestId, handleData);
             }

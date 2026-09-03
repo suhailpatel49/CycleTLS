@@ -249,12 +249,14 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 				ServerName:         c.ProxyURL.Hostname(),
 				InsecureSkipVerify: true,
 			}
-			tlsConn, err := tls.Dial(network, c.ProxyURL.Host, &tlsConf)
+			proxyConn, err := c.Dialer.DialContext(ctx, network, c.ProxyURL.Host)
 			if err != nil {
 				return nil, err
 			}
-			err = tlsConn.Handshake()
+			tlsConn := tls.Client(proxyConn, &tlsConf)
+			err = tlsConn.HandshakeContext(ctx)
 			if err != nil {
+				_ = proxyConn.Close()
 				return nil, err
 			}
 			negotiatedProtocol = tlsConn.ConnectionState().NegotiatedProtocol
