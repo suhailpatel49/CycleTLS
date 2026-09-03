@@ -3,13 +3,12 @@ package main
 import (
 	"flag"
 
+	"github.com/Danny-Dasilva/CycleTLS/cycletls"
 	"log"
 	nhttp "net/http"
 	"os"
 	"runtime"
-	"github.com/Danny-Dasilva/CycleTLS/cycletls"
 )
-
 
 func setupRoutes() {
 	nhttp.HandleFunc("/", cycletls.WSEndpoint)
@@ -19,9 +18,9 @@ func main() {
 	port, exists := os.LookupEnv("WS_PORT")
 	var addr *string
 	if exists {
-		addr = flag.String("addr", ":"+port, "http service address")
+		addr = flag.String("addr", "127.0.0.1:"+port, "http service address")
 	} else {
-		addr = flag.String("addr", ":9112", "http service address")
+		addr = flag.String("addr", "127.0.0.1:9112", "http service address")
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())

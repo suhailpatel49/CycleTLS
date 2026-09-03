@@ -14,12 +14,6 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// Global client pool for connection reuse
-var (
-	clientPool      = make(map[string]fhttp.Client)
-	clientPoolMutex = sync.RWMutex{}
-)
-
 // ClientPoolEntry represents a cached client with metadata
 type ClientPoolEntry struct {
 	Client    fhttp.Client
@@ -31,6 +25,12 @@ type ClientPoolEntry struct {
 var (
 	advancedClientPool      = make(map[string]*ClientPoolEntry)
 	advancedClientPoolMutex = sync.RWMutex{}
+	clientPoolCleanupOnce   sync.Once
+)
+
+const (
+	maxPooledClients = 2048
+	clientIdleTTL    = 5 * time.Minute
 )
 
 type Browser struct {
@@ -192,6 +192,15 @@ func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userA
 	if !enableConnectionReuse {
 		return createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
 	}
+	clientPoolCleanupOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				cleanupClientPool(clientIdleTTL)
+			}
+		}()
+	})
 
 	proxy := ""
 	if len(proxyURL) > 0 {
@@ -201,15 +210,14 @@ func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userA
 	clientKey := generateClientKey(browser, timeout, disableRedirect, proxy)
 
 	// Try to get existing client from pool
-	advancedClientPoolMutex.RLock()
+	advancedClientPoolMutex.Lock()
 	if entry, exists := advancedClientPool[clientKey]; exists {
-		// Update last used time
 		entry.LastUsed = time.Now()
 		client := entry.Client
-		advancedClientPoolMutex.RUnlock()
+		advancedClientPoolMutex.Unlock()
 		return client, nil
 	}
-	advancedClientPoolMutex.RUnlock()
+	advancedClientPoolMutex.Unlock()
 
 	// Create new client if not found in pool
 	advancedClientPoolMutex.Lock()
@@ -229,6 +237,19 @@ func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userA
 
 	// Add to pool
 	now := time.Now()
+	if len(advancedClientPool) >= maxPooledClients {
+		var oldestKey string
+		var oldestEntry *ClientPoolEntry
+		for key, entry := range advancedClientPool {
+			if oldestEntry == nil || entry.LastUsed.Before(oldestEntry.LastUsed) {
+				oldestKey, oldestEntry = key, entry
+			}
+		}
+		if oldestEntry != nil {
+			closeClientConnections(oldestEntry.Client)
+			delete(advancedClientPool, oldestKey)
+		}
+	}
 	advancedClientPool[clientKey] = &ClientPoolEntry{
 		Client:    client,
 		CreatedAt: now,
@@ -265,8 +286,15 @@ func cleanupClientPool(maxAge time.Duration) {
 	now := time.Now()
 	for key, entry := range advancedClientPool {
 		if now.Sub(entry.LastUsed) > maxAge {
+			closeClientConnections(entry.Client)
 			delete(advancedClientPool, key)
 		}
+	}
+}
+
+func closeClientConnections(client fhttp.Client) {
+	if transport, ok := client.Transport.(*roundTripper); ok {
+		transport.CloseIdleConnections()
 	}
 }
 
@@ -277,9 +305,7 @@ func clearAllConnections() {
 
 	// Close all connections in the pool before clearing
 	for _, entry := range advancedClientPool {
-		if transport, ok := entry.Client.Transport.(*roundTripper); ok {
-			transport.CloseIdleConnections()
-		}
+		closeClientConnections(entry.Client)
 	}
 
 	// Clear the entire pool

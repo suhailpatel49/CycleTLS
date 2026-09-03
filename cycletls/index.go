@@ -101,6 +101,7 @@ type fullRequest struct {
 	req       *http.Request
 	client    http.Client
 	options   cycleTLSRequest
+	err       error
 	sseClient *SSEClient       // For SSE connections
 	wsClient  *WebSocketClient // For WebSocket connections
 }
@@ -127,6 +128,7 @@ func WithRawBytes() Option {
 
 var activeRequests = make(map[string]context.CancelFunc)
 var activeRequestsMutex sync.Mutex
+var requestSlots = make(chan struct{}, 512)
 var debugLogger = log.New(os.Stdout, "DEBUG: ", log.Ldate|log.Ltime|log.Lshortfile)
 
 // ready Request
@@ -187,7 +189,8 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 		request.Options.Proxy,
 	)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	// Handle both string body and byte body
@@ -199,7 +202,8 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 	}
 	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(request.Options.Method), request.Options.URL, bodyReader)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 	headerorder := []string{}
 	//master header order, all your headers will be ordered based on this list and anything extra will be appended to the end
@@ -268,7 +272,8 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 	//set our Host header
 	u, err := url.Parse(request.Options.URL)
 	if err != nil {
-		panic(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	//append our normal headers
@@ -339,7 +344,8 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 		request.Options.Proxy,
 	)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	// Handle both string body and byte body
@@ -351,7 +357,8 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 	}
 	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(request.Options.Method), request.Options.URL, bodyReader)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	// Set headers for HTTP/3 request
@@ -364,7 +371,8 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 	// Parse URL for Host header
 	u, err := url.Parse(request.Options.URL)
 	if err != nil {
-		panic(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 	// Respect user-provided Host header for domain fronting; otherwise default to URL host
 	if _, ok := request.Options.Headers["Host"]; !ok {
@@ -427,7 +435,8 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 		request.Options.Proxy,
 	)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	// Prepare headers for SSE
@@ -442,7 +451,8 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 	// Create a placeholder request for consistency
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, request.Options.URL, nil)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	activeRequestsMutex.Lock()
@@ -505,7 +515,8 @@ func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
 	// Create a placeholder request for consistency
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, request.Options.URL, nil)
 	if err != nil {
-		log.Fatal(err)
+		cancel()
+		return fullRequest{options: request, err: err}
 	}
 
 	activeRequestsMutex.Lock()
@@ -596,7 +607,33 @@ func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
 // 	}
 // }
 
+func writeErrorFrame(requestID string, statusCode int, message string, chanWrite chan []byte) {
+	if len(message) > 65535 {
+		message = message[:65535]
+	}
+
+	var b bytes.Buffer
+	b.WriteByte(byte(len(requestID) >> 8))
+	b.WriteByte(byte(len(requestID)))
+	b.WriteString(requestID)
+	b.WriteByte(0)
+	b.WriteByte(5)
+	b.WriteString("error")
+	b.WriteByte(byte(statusCode >> 8))
+	b.WriteByte(byte(statusCode))
+	b.WriteByte(byte(len(message) >> 8))
+	b.WriteByte(byte(len(message)))
+	b.WriteString(message)
+	chanWrite <- b.Bytes()
+}
+
 func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
+	if res.err != nil {
+		parsedError := parseError(res.err)
+		writeErrorFrame(res.options.RequestID, parsedError.StatusCode, parsedError.ErrorMsg+"-> \n"+res.err.Error(), chanWrite)
+		return
+	}
+
 	// Handle SSE connections
 	if res.sseClient != nil {
 		dispatchSSEAsync(res, chanWrite)
@@ -615,61 +652,17 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 		activeRequestsMutex.Unlock()
 	}()
 
-	// Extract host from URL for connection reuse tracking
-	urlObj, _ := url.Parse(res.options.Options.URL)
-	hostPort := urlObj.Host
-	if !strings.Contains(hostPort, ":") {
-		if urlObj.Scheme == "https" {
-			hostPort = hostPort + ":443" // Default HTTPS port
-		} else {
-			hostPort = hostPort + ":80" // Default HTTP port
-		}
-	}
-
-	// Don't close connections when finished - they'll be reused for the same host
-	// Instead, tell the roundtripper to keep this connection but close others
-	defer func() {
-		// Use type assertion to access the roundTripper
-		if transport, ok := res.client.Transport.(*roundTripper); ok {
-			transport.CloseIdleConnections(hostPort)
-		}
-	}()
-
 	finalUrl := res.options.Options.URL
 
 	resp, err := res.client.Do(res.req)
 
 	if err != nil {
 		parsedError := parseError(err)
-
-		{
-			var b bytes.Buffer
-			var requestIDLength = len(res.options.RequestID)
-
-			b.WriteByte(byte(requestIDLength >> 8))
-			b.WriteByte(byte(requestIDLength))
-			b.WriteString(res.options.RequestID)
-			b.WriteByte(0)
-			b.WriteByte(5)
-			b.WriteString("error")
-			b.WriteByte(byte(parsedError.StatusCode >> 8))
-			b.WriteByte(byte(parsedError.StatusCode))
-
-			var message = parsedError.ErrorMsg + "-> \n" + string(err.Error())
-			var messageLength = len(message)
-
-			b.WriteByte(byte(messageLength >> 8))
-			b.WriteByte(byte(messageLength))
-			b.WriteString(message)
-
-			chanWrite <- b.Bytes()
-		}
-
+		writeErrorFrame(res.options.RequestID, parsedError.StatusCode, parsedError.ErrorMsg+"-> \n"+err.Error(), chanWrite)
 		return
 	}
 
 	defer resp.Body.Close()
-
 	// Update finalUrl if redirect occurred
 	if resp != nil && resp.Request != nil && resp.Request.URL != nil {
 		finalUrl = resp.Request.URL.String()
@@ -919,21 +912,22 @@ func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 	}
 
 	// Read SSE events
+loop:
 	for {
 		select {
 		case <-res.req.Context().Done():
 			debugLogger.Printf("SSE request %s was canceled", res.options.RequestID)
-			break
+			break loop
 
 		default:
 			event, err := sseResp.NextEvent()
 			if err != nil {
 				if err == io.EOF {
 					// Normal end of stream
-					break
+					break loop
 				}
 				debugLogger.Printf("SSE read error: %s", err.Error())
-				break
+				break loop
 			}
 
 			if event == nil {
@@ -1037,6 +1031,8 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		Response: resp,
 	}
 	defer wsResp.Close()
+	stopCancellation := context.AfterFunc(res.req.Context(), func() { _ = wsResp.Close() })
+	defer stopCancellation()
 
 	// Send initial response with headers
 	{
@@ -1191,17 +1187,35 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 }
 
 func writeSocket(chanWrite chan []byte, wsSocket *websocket.Conn) {
+	writeFailed := false
 	for buf := range chanWrite {
+		if writeFailed {
+			continue
+		}
 		err := wsSocket.WriteMessage(websocket.BinaryMessage, buf)
 
 		if err != nil {
 			log.Print("Socket WriteMessage Failed" + err.Error())
-			continue
+			writeFailed = true
+			_ = wsSocket.Close()
 		}
 	}
 }
 
 func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
+	requestIDs := make(map[string]struct{})
+	defer func() {
+		activeRequestsMutex.Lock()
+		for requestID := range requestIDs {
+			if cancel, exists := activeRequests[requestID]; exists {
+				cancel()
+				delete(activeRequests, requestID)
+			}
+		}
+		activeRequestsMutex.Unlock()
+		close(chanRead)
+	}()
+
 	for {
 		_, message, err := wsSocket.ReadMessage()
 		if err != nil {
@@ -1240,26 +1254,35 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 			log.Print("Unmarshal Error", err)
 			return
 		}
+		requestIDs[request.RequestID] = struct{}{}
 		chanRead <- processRequest(*request)
 	}
 }
 
 // Worker
 func readProcess(chanRead chan fullRequest, chanWrite chan []byte) {
+	var requests sync.WaitGroup
 	for request := range chanRead {
-		go dispatcherAsync(request, chanWrite)
+		requestSlots <- struct{}{}
+		requests.Add(1)
+		go func() {
+			defer requests.Done()
+			defer func() { <-requestSlots }()
+			dispatcherAsync(request, chanWrite)
+		}()
 	}
+	requests.Wait()
+	close(chanWrite)
 }
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	CheckOrigin:     func(r *nhttp.Request) bool { return true },
 }
 
 // WSEndpoint exports the main cycletls function as we websocket connection that clients can connect to
 func WSEndpoint(w nhttp.ResponseWriter, r *nhttp.Request) {
-	upgrader.CheckOrigin = func(r *nhttp.Request) bool { return true }
-
 	// upgrade this connection to a WebSocket
 	// connection
 	ws, err := upgrader.Upgrade(w, r, nil)
@@ -1280,14 +1303,17 @@ func WSEndpoint(w nhttp.ResponseWriter, r *nhttp.Request) {
 		}
 		headers, err := PrettyStruct(r.Header)
 		if err != nil {
-			log.Fatal(err)
+			log.Print("Invalid Request: Header Conversion failed: ", err)
+			return
 		}
 		log.Println(headers)
 		log.Println(body)
 
 	} else {
+		defer ws.Close()
+		ws.SetReadLimit(16 * 1024 * 1024)
 		chanRead := make(chan fullRequest)
-		chanWrite := make(chan []byte)
+		chanWrite := make(chan []byte, 256)
 
 		go readSocket(chanRead, ws)
 		go readProcess(chanRead, chanWrite)
@@ -1305,9 +1331,9 @@ func main() {
 	port, exists := os.LookupEnv("WS_PORT")
 	var addr *string
 	if exists {
-		addr = flag.String("addr", ":"+port, "http service address")
+		addr = flag.String("addr", "127.0.0.1:"+port, "http service address")
 	} else {
-		addr = flag.String("addr", ":9112", "http service address")
+		addr = flag.String("addr", "127.0.0.1:9112", "http service address")
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())

@@ -69,6 +69,8 @@ export interface CycleTLSRequestOptions {
   headerOrder?: string[];
   orderAsProvided?: boolean;
   insecureSkipVerify?: boolean;
+  enableConnectionReuse?: boolean;
+  signal?: AbortSignal;
   
   // Protocol options
   forceHTTP1?: boolean;
@@ -155,8 +157,8 @@ class InstanceManager {
   async removeSharedInstance(port: number): Promise<void> {
     const sharedInstance = this.sharedInstances.get(port);
     if (sharedInstance) {
-      await sharedInstance.cleanup();
       this.sharedInstances.delete(port);
+      await sharedInstance.cleanup();
     }
   }
 
@@ -229,7 +231,7 @@ class SharedInstance extends EventEmitter {
     });
 
     // Start listening last so that the above listeners are in place
-    this.httpServer.listen(this.port);
+    this.httpServer.listen(this.port, '127.0.0.1');
   }
 
   private spawnServer(): void {
@@ -271,7 +273,7 @@ class SharedInstance extends EventEmitter {
       }
 
       const spawnOptions: SpawnOptionsWithoutStdio = {
-        env: { WS_PORT: this.port.toString() },
+        env: { ...process.env, WS_PORT: this.port.toString() },
         shell: process.platform !== "win32", // false for Windows, true for others
         windowsHide: true,
         detached: process.platform !== "win32",
@@ -291,15 +293,15 @@ class SharedInstance extends EventEmitter {
           const [requestId, error] = errorMessage.split("Request_Id_On_The_Left");
           // Handle request-specific error
         } else {
+          if (/address already in use/i.test(errorMessage)) {
+            this.isHost = false;
+            return;
+          }
           // Only restart on truly fatal errors
           const fatalErrorPattern = /panic|fatal error|runtime error|address already in use/i;
           
           if (fatalErrorPattern.test(errorMessage)) {
-            // Critical error - restart the process
-            this.cleanExit(
-              `Fatal error detected (please open an issue https://github.com/Danny-Dasilva/CycleTLS/issues/new/choose) -> ${errorMessage}`
-            );
-            this.handleSpawn(fileName);
+            console.error(`CycleTLS subprocess error: ${errorMessage}`);
           } else {
             // Non-fatal error - just log it for debugging
             if (this.debug) {
@@ -317,7 +319,14 @@ class SharedInstance extends EventEmitter {
           console.error(`Executable not found at: ${execPath}`);
           console.error('Please ensure the executable exists and has correct permissions');
         }
-        throw error;
+      });
+
+      const spawnedChild = this.child;
+      spawnedChild.once('exit', () => {
+        if (this.child === spawnedChild) this.child = null;
+        if (this.isHost && !this.isShuttingDown) {
+          setTimeout(() => this.handleSpawn(fileName), 100);
+        }
       });
 
     } catch (error) {
@@ -328,7 +337,18 @@ class SharedInstance extends EventEmitter {
 
   private createClient(resolve: () => void, reject: (reason: string) => void): void {
     const attemptConnection = () => {
-      const server = new WebSocket(`ws://localhost:${this.port}`);
+      const server = new WebSocket(`ws://127.0.0.1:${this.port}`);
+      let retryScheduled = false;
+      const retry = (error?: Error) => {
+        if (retryScheduled || this.isShuttingDown || this.failedInitialization) return;
+        retryScheduled = true;
+        if (this.server === server) this.server = null;
+        if (!this.isHost && (error as any)?.code === 'ECONNREFUSED') {
+          this.isHost = true;
+          this.spawnServer();
+        }
+        setTimeout(attemptConnection, 100);
+      };
 
       server.on("open", () => {
         // When connected, clear the connection timeout if it exists.
@@ -336,6 +356,7 @@ class SharedInstance extends EventEmitter {
           clearTimeout(this.connectionTimeout);
           this.connectionTimeout = null;
         }
+        this.failedInitialization = false;
         this.server = server;
 
         this.server.on("message", (data: Buffer) => {
@@ -404,16 +425,8 @@ class SharedInstance extends EventEmitter {
         resolve();
       });
 
-      server.on("error", (err) => {
-        // On error, remove the listeners and try again after a short delay.
-        server.removeAllListeners();
-        setTimeout(() => {
-          if (this.failedInitialization) {
-            return;
-          }
-          attemptConnection();
-        }, 100);
-      });
+      server.once("error", retry);
+      server.once("close", retry);
     };
 
     attemptConnection();
@@ -434,12 +447,12 @@ class SharedInstance extends EventEmitter {
     this.clients.set(clientId, client);
   }
 
-  removeClient(clientId: string): void {
+  async removeClient(clientId: string): Promise<void> {
     this.clients.delete(clientId);
     
     // If no more clients, cleanup the shared instance
     if (this.clients.size === 0) {
-      InstanceManager.getInstance().removeSharedInstance(this.port);
+      await InstanceManager.getInstance().removeSharedInstance(this.port);
     }
   }
 
@@ -496,17 +509,37 @@ class SharedInstance extends EventEmitter {
       options.body = formDataString;
     }
 
-    if (this.server) {
-      this.server.send(JSON.stringify({ requestId, options }));
-    } else {
-      throw new Error('WebSocket server not connected');
+    const connectionDeadline = Date.now() + Math.min(this.timeout, 5000);
+    let server = this.server;
+    while ((!server || server.readyState !== WebSocket.OPEN) && Date.now() < connectionDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      server = this.server;
     }
+    if (!server || server.readyState !== WebSocket.OPEN) throw new Error('WebSocket server not connected');
+
+    while (server.bufferedAmount > 8 * 1024 * 1024 && server.readyState === WebSocket.OPEN) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    if (server.readyState !== WebSocket.OPEN) throw new Error('WebSocket server disconnected');
+
+    await new Promise<void>((resolve, reject) => {
+      server.send(JSON.stringify({ requestId, options }), (error) => error ? reject(error) : resolve());
+    });
   }
 
   async cancelRequest(requestId: string): Promise<void> {
     if (this.server) {
       this.server.send(JSON.stringify({ action: "cancel", requestId }));
     }
+  }
+
+  pauseResponses(): void {
+    // ponytail: this pauses the shared socket. Split by client if one slow stream blocks others.
+    (this.server as any)?._socket?.pause();
+  }
+
+  resumeResponses(): void {
+    (this.server as any)?._socket?.resume();
   }
 
   private async cleanExit(message?: string | Error): Promise<void> {
@@ -535,6 +568,8 @@ class SharedInstance extends EventEmitter {
   }
 
   async cleanup(): Promise<void> {
+    this.isShuttingDown = true;
+
     // Clear any pending timeouts
     if (this.connectionTimeout) {
       clearTimeout(this.connectionTimeout);
@@ -554,22 +589,32 @@ class SharedInstance extends EventEmitter {
 
     // Kill child process forcefully
     if (this.isHost && this.child) {
+      const child = this.child;
+      const childExited = new Promise<void>((resolve) => {
+        if (child.exitCode !== null || child.signalCode !== null) return resolve();
+        const timeout = setTimeout(resolve, 1000);
+        child.once('exit', () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+      });
       if (process.platform === "win32") {
         try {
-          this.child.kill('SIGKILL');
+          child.kill('SIGKILL');
         } catch (error) {
           console.error("Error killing Windows process:", error);
         }
       } else {
         try {
-          process.kill(-this.child.pid!, 'SIGKILL');
+          process.kill(-child.pid!, 'SIGKILL');
         } catch (error) {
           if ((error as any).code !== "ESRCH") {
             console.error("Error killing process:", error);
           }
         }
       }
-      this.child = null;
+      await childExited;
+      if (this.child === child) this.child = null;
     }
 
     // Force close the WebSocket immediately
@@ -597,7 +642,6 @@ class SharedInstance extends EventEmitter {
 class CycleTLSClientImpl extends EventEmitter {
   private sharedInstance: SharedInstance;
   private clientId: string;
-  private connectionsByHost: Map<string, boolean> = new Map();
   
   constructor(sharedInstance: SharedInstance) {
     super();
@@ -620,10 +664,6 @@ class CycleTLSClientImpl extends EventEmitter {
     options: CycleTLSRequestOptions,
     method: "head" | "get" | "post" | "put" | "delete" | "trace" | "options" | "connect" | "patch" = "get"
   ): Promise<CycleTLSResponse> {
-    // Track connection reuse by parsing the URL's host
-    const urlObj = new URL(url);
-    const hostKey = urlObj.host;
-
     const requestId = `${this.clientId}#${url}#${Date.now()}-${Math.floor(1000 * Math.random())}`;
 
     //set default options
@@ -645,6 +685,7 @@ class CycleTLSClientImpl extends EventEmitter {
     if (!options?.insecureSkipVerify) options.insecureSkipVerify = false;
     if (!options?.forceHTTP1) options.forceHTTP1 = false;
     if (!options?.forceHTTP3) options.forceHTTP3 = false;
+    if (options.enableConnectionReuse === undefined) options.enableConnectionReuse = true;
     if (!options?.responseType) options.responseType = 'json';
     if (!options?.protocol) {
       // Default to standard HTTP protocol
@@ -666,24 +707,24 @@ class CycleTLSClientImpl extends EventEmitter {
     
 
 
-    // Track if we've connected to this host before for connection reuse
-    const hasExistingConnection = this.connectionsByHost.has(hostKey);
-    
-    // Set the connection as tracked for this host
-    this.connectionsByHost.set(hostKey, true);
-    
-    // Send request through shared instance
-    await this.sharedInstance.sendRequest(requestId, {
-      url,
-      ...options,
-      method,
-      // Add metadata about connection reuse (will be ignored by Go if not implemented)
-      _connectionReuse: hasExistingConnection ? "reuse" : "new",
-      _hostKey: hostKey,
-    });
-
     return new Promise((resolveRequest, rejectRequest) => {
       let responseMetadata: any = null;
+      let responseStream: Readable | null = null;
+      const cleanupAbort = () => options.signal?.removeEventListener('abort', handleAbort);
+      const handleAbort = () => {
+        this.removeAllListeners(requestId);
+        this.sharedInstance.cancelRequest(requestId);
+        const error: any = new Error('CycleTLS request was aborted');
+        error.code = 'ABORT_ERR';
+        responseStream?.destroy(error);
+        rejectRequest(error);
+      };
+
+      if (options.signal?.aborted) {
+        handleAbort();
+        return;
+      }
+      options.signal?.addEventListener('abort', handleAbort, { once: true });
 
       const handleMessage = async (response: any) => {
         if (response.method === "error") {
@@ -701,6 +742,7 @@ class CycleTLSClientImpl extends EventEmitter {
             blob: async () => Promise.resolve(new Blob([response.data.message], { type: 'text/plain' }))
           };
           this.off(requestId, handleMessage);
+          cleanupAbort();
           resolveRequest(errorResponse);
         } else if (response.method === "response") {
           // Store response metadata but don't resolve yet
@@ -712,9 +754,14 @@ class CycleTLSClientImpl extends EventEmitter {
           // Remove the message handler and set up stream handling
           this.off(requestId, handleMessage);
 
-          const stream = new Readable({ read() { } });
+          const stream = new Readable({
+            read: () => this.sharedInstance.resumeResponses()
+          });
+          responseStream = stream;
 
           const handleClose = () => {
+            cleanupAbort();
+            this.sharedInstance.resumeResponses();
             this.sharedInstance.cancelRequest(requestId);
           };
 
@@ -722,19 +769,31 @@ class CycleTLSClientImpl extends EventEmitter {
 
           const handleData = (response: any) => {
             if (response.method === "data") {
-              stream.push(Buffer.from(response.data));
+              if (!stream.push(Buffer.from(response.data))) {
+                this.sharedInstance.pauseResponses();
+              }
             } else if (response.method === "error") {
               // Handle error that occurred during body read - store it and close the stream
               bodyReadError = {
                 statusCode: response.data.statusCode,
                 message: response.data.message
               };
-              stream.push(null); // Close stream gracefully
-              stream.off("close", handleClose);
+              if (options.responseType === 'stream') {
+                const streamError: any = new Error(response.data.message);
+                streamError.statusCode = response.data.statusCode;
+                stream.destroy(streamError);
+              } else {
+                stream.push(null);
+                stream.off("close", handleClose);
+              }
+              this.sharedInstance.resumeResponses();
+              cleanupAbort();
               this.off(requestId, handleData);
             } else if (response.method === "end") {
               stream.push(null);
               stream.off("close", handleClose);
+              this.sharedInstance.resumeResponses();
+              cleanupAbort();
               this.off(requestId, handleData);
             }
           };
@@ -830,6 +889,16 @@ class CycleTLSClientImpl extends EventEmitter {
       };
 
       this.on(requestId, handleMessage);
+      const { signal, ...requestOptions } = options;
+      this.sharedInstance.sendRequest(requestId, {
+        url,
+        ...requestOptions,
+        method,
+      }).catch((error) => {
+        this.off(requestId, handleMessage);
+        cleanupAbort();
+        rejectRequest(error);
+      });
     });
   }
 
@@ -894,7 +963,7 @@ class CycleTLSClientImpl extends EventEmitter {
 
   async exit(): Promise<undefined> {
     // Remove this client from the shared instance
-    this.sharedInstance.removeClient(this.clientId);
+    await this.sharedInstance.removeClient(this.clientId);
     
     // Clean up this client's event listeners
     this.removeAllListeners();
@@ -917,7 +986,6 @@ const globalCleanup = async () => {
   }
 };
 
-// Set up process-wide cleanup handlers
 process.once("SIGINT", globalCleanup);
 process.once("SIGTERM", globalCleanup);
 process.once("beforeExit", globalCleanup);

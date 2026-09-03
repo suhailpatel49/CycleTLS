@@ -1,8 +1,13 @@
 package cycletls
 
 import (
+	"crypto/tls"
 	"net"
+	stdhttp "net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	http "github.com/Danny-Dasilva/fhttp"
 )
@@ -43,5 +48,86 @@ func TestGetTransport_NoPanicWhenCachedConnPresent(t *testing.T) {
 
 	if err := rt.getTransport(req, addr); err != nil {
 		t.Fatalf("getTransport returned error: %v", err)
+	}
+}
+
+func TestTLSHandshakesForDifferentHostsRunConcurrently(t *testing.T) {
+	clearAllConnections()
+	t.Cleanup(clearAllConnections)
+
+	handshakeStarted := make(chan time.Time, 2)
+	newServer := func() *httptest.Server {
+		server := httptest.NewUnstartedServer(stdhttp.HandlerFunc(func(response stdhttp.ResponseWriter, _ *stdhttp.Request) {
+			response.WriteHeader(stdhttp.StatusOK)
+		}))
+		server.TLS = &tls.Config{
+			GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+				handshakeStarted <- time.Now()
+				time.Sleep(400 * time.Millisecond)
+				return nil, nil
+			},
+		}
+		server.StartTLS()
+		t.Cleanup(server.Close)
+		return server
+	}
+
+	firstServer := newServer()
+	secondServer := newServer()
+	userAgent := "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36"
+	client, err := newClientWithReuse(Browser{
+		UserAgent:          userAgent,
+		InsecureSkipVerify: true,
+		ForceHTTP1:         true,
+	}, 5, true, userAgent, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wait sync.WaitGroup
+	errors := make(chan error, 2)
+	for _, targetURL := range []string{firstServer.URL, secondServer.URL} {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			response, requestErr := client.Get(targetURL)
+			if requestErr == nil {
+				response.Body.Close()
+			}
+			errors <- requestErr
+		}()
+	}
+	wait.Wait()
+	close(errors)
+	for requestErr := range errors {
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+	}
+
+	firstStart := <-handshakeStarted
+	secondStart := <-handshakeStarted
+	difference := secondStart.Sub(firstStart)
+	if difference < 0 {
+		difference = -difference
+	}
+	if difference > 250*time.Millisecond {
+		t.Fatalf("TLS handshakes were serialized: start times differed by %s", difference)
+	}
+}
+
+func TestInvalidRequestReturnsErrorWithoutStoppingServer(t *testing.T) {
+	request := cycleTLSRequest{
+		RequestID: "invalid-request",
+		Options: Options{
+			URL:     "://bad-url",
+			Method:  "get",
+			Headers: map[string]string{},
+		},
+	}
+
+	result := processRequest(request)
+	if result.err == nil {
+		t.Fatal("expected invalid URL to return an error")
 	}
 }

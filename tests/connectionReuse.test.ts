@@ -42,8 +42,7 @@ describe("Connection Reuse Tests", () => {
       res.end("OK");
     });
     
-    // Track TLS handshakes by hooking into the connection event
-    server.on('newSession', () => {
+    server.on('secureConnection', () => {
       handshakeCount++;
     });
     
@@ -90,9 +89,7 @@ describe("Connection Reuse Tests", () => {
     const countResponse = await cycleTLS.get(`${url}/handshake-count`, options);
     const count = parseInt(await countResponse.text(), 10);
     
-    // If connection reuse is working, we expect only 1 handshake
-    // But we'll allow up to 2 since the count request itself might trigger a new connection
-    expect(count).toBeLessThanOrEqual(2);
+    expect(count).toBe(1);
     
     // Exit CycleTLS to clean up
     await cycleTLS.exit();
