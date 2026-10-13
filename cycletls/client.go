@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	fhttp "github.com/Danny-Dasilva/fhttp"
+	"net"
 	"sync"
 	"time"
 
@@ -51,6 +52,7 @@ type Browser struct {
 	InsecureSkipVerify bool
 	ForceHTTP1         bool
 	ForceHTTP3         bool
+	Resolver           string // "cloudflare", or "" for the system resolver
 
 	// TLS 1.3 specific options
 	TLS13AutoRetry bool
@@ -165,7 +167,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 	}
 
 	// Create a hash of the configuration that affects connection behavior
-	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|sni:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s",
+	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|sni:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t|resolver:%s%s",
 		browser.JA3,
 		browser.JA4r,
 		browser.HTTP2Fingerprint,
@@ -178,6 +180,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 		browser.InsecureSkipVerify,
 		browser.ForceHTTP1,
 		browser.ForceHTTP3,
+		browser.Resolver,
 		cookieStr,
 	)
 
@@ -271,6 +274,8 @@ func createNewClient(browser Browser, timeout int, disableRedirect bool, userAge
 				CheckRedirect: disabledRedirect,
 			}, err
 		}
+	} else if resolver := resolverFor(browser.Resolver); resolver != nil {
+		dialer = &net.Dialer{Resolver: resolver}
 	} else {
 		dialer = proxy.Direct
 	}

@@ -47,6 +47,7 @@ type roundTripper struct {
 	Cookies            []Cookie
 	ForceHTTP1         bool
 	ForceHTTP3         bool
+	Resolver           string
 
 	// TLS 1.3 specific options
 	TLS13AutoRetry bool
@@ -637,6 +638,7 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 		InsecureSkipVerify: browser.InsecureSkipVerify,
 		ForceHTTP1:         browser.ForceHTTP1,
 		ForceHTTP3:         browser.ForceHTTP3,
+		Resolver:           browser.Resolver,
 
 		// TLS 1.3 specific options
 		TLS13AutoRetry: browser.TLS13AutoRetry,
@@ -672,6 +674,30 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request) (*http.Response, err
 				DisablePathMTUDiscovery:        false,
 				Allow0RTT:                      false,
 			},
+		}
+		if resolver := resolverFor(rt.Resolver); resolver != nil {
+			rt.http3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				ips, err := resolver.LookupIPAddr(ctx, host)
+				if err != nil {
+					return nil, err
+				}
+				if len(ips) == 0 {
+					return nil, fmt.Errorf("no IP addresses found for host %s", host)
+				}
+				// Prefer IPv4, like quic-go's default dial.
+				ip := ips[0].IP
+				for _, candidate := range ips {
+					if candidate.IP.To4() != nil {
+						ip = candidate.IP
+						break
+					}
+				}
+				return quic.DialAddrEarly(ctx, net.JoinHostPort(ip.String(), port), tlsCfg, cfg)
+			}
 		}
 	}
 	roundTripper := rt.http3Transport

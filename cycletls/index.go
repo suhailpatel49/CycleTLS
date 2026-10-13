@@ -78,6 +78,7 @@ type Options struct {
 	HeaderOrder        []string `json:"headerOrder"`
 	OrderAsProvided    bool     `json:"orderAsProvided"` //TODO
 	InsecureSkipVerify bool     `json:"insecureSkipVerify"`
+	Resolver           string   `json:"resolver"` // "cloudflare", or "" for the system resolver
 
 	// Protocol options
 	ForceHTTP1 bool   `json:"forceHTTP1"`
@@ -201,6 +202,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 		InsecureSkipVerify: request.Options.InsecureSkipVerify,
 		ForceHTTP1:         request.Options.ForceHTTP1,
 		ForceHTTP3:         request.Options.ForceHTTP3,
+		Resolver:           request.Options.Resolver,
 
 		// TLS 1.3 specific options
 		TLS13AutoRetry: request.Options.TLS13AutoRetry,
@@ -366,6 +368,7 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 		InsecureSkipVerify: request.Options.InsecureSkipVerify,
 		ForceHTTP1:         false, // Force HTTP/3
 		ForceHTTP3:         true,  // Force HTTP/3
+		Resolver:           request.Options.Resolver,
 
 		// TLS 1.3 specific options (HTTP/3 requires TLS 1.3)
 		TLS13AutoRetry: request.Options.TLS13AutoRetry,
@@ -453,6 +456,7 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 		InsecureSkipVerify: request.Options.InsecureSkipVerify,
 		ForceHTTP1:         request.Options.ForceHTTP1,
 		ForceHTTP3:         request.Options.ForceHTTP3,
+		Resolver:           request.Options.Resolver,
 
 		// TLS 1.3 specific options
 		TLS13AutoRetry: request.Options.TLS13AutoRetry,
@@ -1505,6 +1509,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		InsecureSkipVerify: options.InsecureSkipVerify,
 		ForceHTTP1:         options.ForceHTTP1,
 		ForceHTTP3:         options.ForceHTTP3,
+		Resolver:           options.Resolver,
 		HeaderOrder:        options.HeaderOrder,
 	}
 
