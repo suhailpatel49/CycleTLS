@@ -70,15 +70,16 @@ type Options struct {
 	UserAgent string `json:"userAgent"`
 
 	// Connection options
-	Proxy              string   `json:"proxy"`
-	ServerName         string   `json:"serverName"` // Custom TLS SNI override
-	Cookies            []Cookie `json:"cookies"`
-	Timeout            int      `json:"timeout"`
-	DisableRedirect    bool     `json:"disableRedirect"`
-	HeaderOrder        []string `json:"headerOrder"`
-	OrderAsProvided    bool     `json:"orderAsProvided"` //TODO
-	InsecureSkipVerify bool     `json:"insecureSkipVerify"`
-	Resolver           string   `json:"resolver"` // "cloudflare", or "" for the system resolver
+	Proxy                 string   `json:"proxy"`
+	ServerName            string   `json:"serverName"` // Custom TLS SNI override
+	Cookies               []Cookie `json:"cookies"`
+	Timeout               int      `json:"timeout"`
+	DisableRedirect       bool     `json:"disableRedirect"`
+	HeaderOrder           []string `json:"headerOrder"`
+	OrderAsProvided       bool     `json:"orderAsProvided"` //TODO
+	InsecureSkipVerify    bool     `json:"insecureSkipVerify"`
+	Resolver              string   `json:"resolver"`              // "cloudflare", or "" for the system resolver
+	BlockPrivateAddresses bool     `json:"blockPrivateAddresses"` // reject direct connections to internal addresses
 
 	// Protocol options
 	ForceHTTP1 bool   `json:"forceHTTP1"`
@@ -197,12 +198,13 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 		UserAgent: request.Options.UserAgent,
 
 		// Connection options
-		ServerName:         request.Options.ServerName,
-		Cookies:            request.Options.Cookies,
-		InsecureSkipVerify: request.Options.InsecureSkipVerify,
-		ForceHTTP1:         request.Options.ForceHTTP1,
-		ForceHTTP3:         request.Options.ForceHTTP3,
-		Resolver:           request.Options.Resolver,
+		ServerName:            request.Options.ServerName,
+		Cookies:               request.Options.Cookies,
+		InsecureSkipVerify:    request.Options.InsecureSkipVerify,
+		ForceHTTP1:            request.Options.ForceHTTP1,
+		ForceHTTP3:            request.Options.ForceHTTP3,
+		Resolver:              request.Options.Resolver,
+		BlockPrivateAddresses: request.Options.BlockPrivateAddresses,
 
 		// TLS 1.3 specific options
 		TLS13AutoRetry: request.Options.TLS13AutoRetry,
@@ -363,12 +365,13 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 		UserAgent: request.Options.UserAgent,
 
 		// Connection options
-		ServerName:         request.Options.ServerName,
-		Cookies:            request.Options.Cookies,
-		InsecureSkipVerify: request.Options.InsecureSkipVerify,
-		ForceHTTP1:         false, // Force HTTP/3
-		ForceHTTP3:         true,  // Force HTTP/3
-		Resolver:           request.Options.Resolver,
+		ServerName:            request.Options.ServerName,
+		Cookies:               request.Options.Cookies,
+		InsecureSkipVerify:    request.Options.InsecureSkipVerify,
+		ForceHTTP1:            false, // Force HTTP/3
+		ForceHTTP3:            true,  // Force HTTP/3
+		Resolver:              request.Options.Resolver,
+		BlockPrivateAddresses: request.Options.BlockPrivateAddresses,
 
 		// TLS 1.3 specific options (HTTP/3 requires TLS 1.3)
 		TLS13AutoRetry: request.Options.TLS13AutoRetry,
@@ -451,12 +454,13 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 		UserAgent: request.Options.UserAgent,
 
 		// Connection options
-		ServerName:         request.Options.ServerName,
-		Cookies:            request.Options.Cookies,
-		InsecureSkipVerify: request.Options.InsecureSkipVerify,
-		ForceHTTP1:         request.Options.ForceHTTP1,
-		ForceHTTP3:         request.Options.ForceHTTP3,
-		Resolver:           request.Options.Resolver,
+		ServerName:            request.Options.ServerName,
+		Cookies:               request.Options.Cookies,
+		InsecureSkipVerify:    request.Options.InsecureSkipVerify,
+		ForceHTTP1:            request.Options.ForceHTTP1,
+		ForceHTTP3:            request.Options.ForceHTTP3,
+		Resolver:              request.Options.Resolver,
+		BlockPrivateAddresses: request.Options.BlockPrivateAddresses,
 
 		// TLS 1.3 specific options
 		TLS13AutoRetry: request.Options.TLS13AutoRetry,
@@ -1500,17 +1504,18 @@ func (client CycleTLS) Close() {
 func (client CycleTLS) Do(URL string, options Options, Method string) (Response, error) {
 	// Create browser from options
 	browser := Browser{
-		JA3:                options.Ja3,
-		JA4r:               options.Ja4r,
-		HTTP2Fingerprint:   options.HTTP2Fingerprint,
-		QUICFingerprint:    options.QUICFingerprint,
-		UserAgent:          options.UserAgent,
-		Cookies:            options.Cookies,
-		InsecureSkipVerify: options.InsecureSkipVerify,
-		ForceHTTP1:         options.ForceHTTP1,
-		ForceHTTP3:         options.ForceHTTP3,
-		Resolver:           options.Resolver,
-		HeaderOrder:        options.HeaderOrder,
+		JA3:                   options.Ja3,
+		JA4r:                  options.Ja4r,
+		HTTP2Fingerprint:      options.HTTP2Fingerprint,
+		QUICFingerprint:       options.QUICFingerprint,
+		UserAgent:             options.UserAgent,
+		Cookies:               options.Cookies,
+		InsecureSkipVerify:    options.InsecureSkipVerify,
+		ForceHTTP1:            options.ForceHTTP1,
+		ForceHTTP3:            options.ForceHTTP3,
+		Resolver:              options.Resolver,
+		BlockPrivateAddresses: options.BlockPrivateAddresses,
+		HeaderOrder:           options.HeaderOrder,
 	}
 
 	// Note: Don't automatically set HeaderOrder from UserAgent here as it can interfere with connection management

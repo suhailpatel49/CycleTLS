@@ -41,13 +41,14 @@ type roundTripper struct {
 	HeaderOrder []string
 
 	// Connection options
-	TLSConfig          *utls.Config
-	InsecureSkipVerify bool
-	ServerName         string
-	Cookies            []Cookie
-	ForceHTTP1         bool
-	ForceHTTP3         bool
-	Resolver           string
+	TLSConfig             *utls.Config
+	InsecureSkipVerify    bool
+	ServerName            string
+	Cookies               []Cookie
+	ForceHTTP1            bool
+	ForceHTTP3            bool
+	Resolver              string
+	BlockPrivateAddresses bool
 
 	// TLS 1.3 specific options
 	TLS13AutoRetry bool
@@ -620,25 +621,26 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 	}
 
 	return &roundTripper{
-		dialer:             contextDialer,
-		JA3:                browser.JA3,
-		JA4r:               browser.JA4r,
-		HTTP2Fingerprint:   browser.HTTP2Fingerprint,
-		QUICFingerprint:    browser.QUICFingerprint,
-		USpec:              browser.USpec, // Add USpec field initialization
-		DisableGrease:      browser.DisableGrease,
-		UserAgent:          browser.UserAgent,
-		HeaderOrder:        browser.HeaderOrder,
-		TLSConfig:          browser.TLSConfig,
-		ServerName:         browser.ServerName,
-		Cookies:            browser.Cookies,
-		cachedTransports:   make(map[string]http.RoundTripper),
-		cachedConnections:  make(map[string]net.Conn),
-		transportLastUsed:  make(map[string]time.Time),
-		InsecureSkipVerify: browser.InsecureSkipVerify,
-		ForceHTTP1:         browser.ForceHTTP1,
-		ForceHTTP3:         browser.ForceHTTP3,
-		Resolver:           browser.Resolver,
+		dialer:                contextDialer,
+		JA3:                   browser.JA3,
+		JA4r:                  browser.JA4r,
+		HTTP2Fingerprint:      browser.HTTP2Fingerprint,
+		QUICFingerprint:       browser.QUICFingerprint,
+		USpec:                 browser.USpec, // Add USpec field initialization
+		DisableGrease:         browser.DisableGrease,
+		UserAgent:             browser.UserAgent,
+		HeaderOrder:           browser.HeaderOrder,
+		TLSConfig:             browser.TLSConfig,
+		ServerName:            browser.ServerName,
+		Cookies:               browser.Cookies,
+		cachedTransports:      make(map[string]http.RoundTripper),
+		cachedConnections:     make(map[string]net.Conn),
+		transportLastUsed:     make(map[string]time.Time),
+		InsecureSkipVerify:    browser.InsecureSkipVerify,
+		ForceHTTP1:            browser.ForceHTTP1,
+		ForceHTTP3:            browser.ForceHTTP3,
+		Resolver:              browser.Resolver,
+		BlockPrivateAddresses: browser.BlockPrivateAddresses,
 
 		// TLS 1.3 specific options
 		TLS13AutoRetry: browser.TLS13AutoRetry,
@@ -675,7 +677,11 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request) (*http.Response, err
 				Allow0RTT:                      false,
 			},
 		}
-		if resolver := resolverFor(rt.Resolver); resolver != nil {
+		if resolver := resolverFor(rt.Resolver); resolver != nil || rt.BlockPrivateAddresses {
+			if resolver == nil {
+				resolver = net.DefaultResolver
+			}
+			blockPrivate := rt.BlockPrivateAddresses
 			rt.http3Transport.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 				host, port, err := net.SplitHostPort(addr)
 				if err != nil {
@@ -696,7 +702,13 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request) (*http.Response, err
 						break
 					}
 				}
-				return quic.DialAddrEarly(ctx, net.JoinHostPort(ip.String(), port), tlsCfg, cfg)
+				dialAddr := net.JoinHostPort(ip.String(), port)
+				if blockPrivate {
+					if err := checkDialAddress(dialAddr); err != nil {
+						return nil, err
+					}
+				}
+				return quic.DialAddrEarly(ctx, dialAddr, tlsCfg, cfg)
 			}
 		}
 	}

@@ -64,6 +64,7 @@ export interface CycleTLSRequestOptions {
   // Connection options
   serverName?: string;     // Overrides TLS Server Name Indication (SNI)
   resolver?: 'cloudflare' | ''; // DNS for direct requests: Cloudflare, or '' for the system resolver
+  blockPrivateAddresses?: boolean; // Direct requests fail when the resolved address is private, loopback or link-local
   proxy?: string;
   timeout?: number;
   disableRedirect?: boolean;

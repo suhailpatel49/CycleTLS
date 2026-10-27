@@ -47,12 +47,13 @@ type Browser struct {
 	UserAgent string
 
 	// Connection options
-	ServerName         string
-	Cookies            []Cookie
-	InsecureSkipVerify bool
-	ForceHTTP1         bool
-	ForceHTTP3         bool
-	Resolver           string // "cloudflare", or "" for the system resolver
+	ServerName            string
+	Cookies               []Cookie
+	InsecureSkipVerify    bool
+	ForceHTTP1            bool
+	ForceHTTP3            bool
+	Resolver              string // "cloudflare", or "" for the system resolver
+	BlockPrivateAddresses bool   // reject direct connections to internal addresses
 
 	// TLS 1.3 specific options
 	TLS13AutoRetry bool
@@ -167,7 +168,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 	}
 
 	// Create a hash of the configuration that affects connection behavior
-	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|sni:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t|resolver:%s%s",
+	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|sni:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t|resolver:%s|blockprivate:%t%s",
 		browser.JA3,
 		browser.JA4r,
 		browser.HTTP2Fingerprint,
@@ -181,6 +182,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 		browser.ForceHTTP1,
 		browser.ForceHTTP3,
 		browser.Resolver,
+		browser.BlockPrivateAddresses,
 		cookieStr,
 	)
 
@@ -274,8 +276,12 @@ func createNewClient(browser Browser, timeout int, disableRedirect bool, userAge
 				CheckRedirect: disabledRedirect,
 			}, err
 		}
-	} else if resolver := resolverFor(browser.Resolver); resolver != nil {
-		dialer = &net.Dialer{Resolver: resolver}
+	} else if resolver := resolverFor(browser.Resolver); resolver != nil || browser.BlockPrivateAddresses {
+		direct := &net.Dialer{Resolver: resolver}
+		if browser.BlockPrivateAddresses {
+			direct.Control = rejectPrivateAddressControl
+		}
+		dialer = direct
 	} else {
 		dialer = proxy.Direct
 	}
